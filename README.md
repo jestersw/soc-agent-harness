@@ -1,120 +1,87 @@
-# BlueSec1 agent
+# SOC Agent Harness
 
-Reference agent for the BlueSec1 competition. An LLM receives a security alert,
-explores the evidence graph through the runtime tools and submits a verdict:
-a real attack or a false positive.
+An LLM agent that triages security alerts: it explores an evidence graph through
+runtime tools and submits a verdict (`malicious` or `benign`) with incident-response
+artifacts. Built for the BlueSec 2026 agent tournament.
 
-Use it as a starting point. Change the prompt and the reasoning loop, keep the
-client as is.
+The model is a cheap, fast one (DeepSeek V4 Flash). Most of the score came from
+the harness around it, not from the model.
 
-## Before you start
+## Results
 
-You need Python 3.11 or newer, [uv](https://docs.astral.sh/uv/), and an
-OpenAI-compatible LLM provider with an API key.
+| Version | Arena | Score | Notes |
+|---|---|---|---|
+| v7 | practice | 10.81 | baseline harness |
+| v8 | practice | 13.69 | verdict rules against living-off-the-land attacks |
+| v8 | tournament | **19.52** | 40/40 tasks, 4 parallel workers |
+| v9.1 | tournament | 17.02 | v8 + admin-activity and brute-force rules |
 
-Take the runtime address and your access key from the competition site:
-https://bluesec.team/
+Cost: about $0,01-0.05 per task, roughly $2 for the whole tournament day.
 
-## Quick start
+## How it works
+alert -> auto search on the alert process
+-> loop: LLM picks the next tool call (structured JSON)
+-> harness validates the call (ids, duplicates, budget)
+-> runtime tool -> compact feedback back to the LLM
+-> finish_investigation (verdict + artifacts or legitimacy evidence)
+
+## Key engineering decisions
+
+- **ID grounding.** `IdIndex` tracks every entity, relation and AD object id seen in
+  the alert and tool results. Calls with invented ids are blocked locally or
+  rerouted to `search`, so the agent does not pay runtime penalties for
+  hallucinated ids. The final submission is sanitized against the same index.
+- **Robust structured output.** The client rotates `json_schema`, `json_object` and
+  plain modes between retries, extracts JSON from noisy replies, and parses
+  DeepSeek's native DSML tool-call format when the model ignores the schema.
+- **Lean history.** Tool feedback contains only the keys that changed in the
+  observation, which cut prompt growth from ~7k tokens per step to a few hundred.
+- **Loop control.** Duplicate calls are blocked, repeated blocked steps force a new
+  search, and the agent is warned when its step budget is running out.
+- **Parallel workers.** `BLUESEC_AGENT_WORKERS` runs several investigations inside
+  one run. Leasing is serialized with a lock and retries when the server's task
+  capacity is reached. Four workers gave about a 3x speedup.
+- **Fault tolerance.** Transport errors and 5xx/429 from the LLM provider are
+  retried with backoff; a failed task abort no longer kills the run. This kept
+  the run alive through a runtime outage during the tournament.
+- **Prompt addenda.** `BLUESEC_PROMPT_EXTRA` appends rules to the system prompt
+  without code changes, which made A/B runs cheap.
+
+## What did not work
+
+- **Admin-activity rule (v9.1).** Treating privileged WinRM/PsExec/GPO activity
+  without concrete attack signals as benign scored well on an 18-task practice
+  sample, but the tournament run with it scored lower (17.02 vs 19.52). Each
+  tournament run gets its own task set, so rule quality and task mix cannot be
+  fully separated. Correct benign verdicts earn few points, while missed attacks
+  cost a lot, so "malicious when in doubt" held up better.
+- **Shorter model outputs** to speed up steps gave only ~6% and were reverted.
+- **A newer model version** (v4.1 flash) cost twice as much with no score gain.
+
+## Running
 
 ```bash
 uv sync
-```
-
-```bash
 cp .env.example .env
-```
-
-Set `SCENARIO_RUNTIME_ENDPOINT` and `SCENARIO_RUNTIME_TOKEN` from the
-competition site, and `LLM_BASE_URL`,
-`LLM_API_KEY`, `LLM_DEFAULT_MODEL` from your provider. Set `AGENT_NAME` too —
-it is shown next to your runs in the competition interface.
-Set `SCENARIO_RUNTIME_ARENA` only when you need a specific arena; otherwise the
-runtime selects the currently open default.
-
-Start the agent with `--env-file` so gRPC receives the resolver setting from
-the environment as well as the application settings.
-
-```bash
 uv run --env-file .env bluesec1-agent
 ```
 
-The agent creates a run, takes tasks until the queue is empty and prints the
-server-side result of each one. Your score appears on the leaderboard.
+Fill in the runtime endpoint and token from the competition site and an
+OpenAI-compatible LLM provider. Optional settings:
 
-You may have only one run in flight. Starting a second one while the first is
-still open is refused until the first finishes.
+| Variable | Purpose |
+|---|---|
+| `LLM_RESPONSE_FORMAT` | `json_object` or `json_schema` as the primary mode |
+| `BLUESEC_AGENT_WORKERS` | parallel investigations per run |
+| `BLUESEC_AGENT_MAX_STEPS` | step budget per task |
+| `BLUESEC_AGENT_MAX_TASKS` | stop after N tasks, useful for quick tests |
+| `BLUESEC_PROMPT_EXTRA` | extra rules appended to the system prompt |
 
-## What a task looks like
+Per-task traces are written to `traces/<task_id>.jsonl`.
 
-You get an alert: a suspicious process, a host, a few identifiers. The evidence
-behind it is a graph — processes, files, network connections, registry writes and
-the relations between them. Your job is to walk that graph, decide whether the
-alert is a real attack, and report either the entities that need a response or
-the graph evidence that proves the activity is legitimate.
+## Attribution
 
-The runtime is the source of truth for tools. Every task observation contains
-`available_tools` with the currently enabled tool calls and the exact argument
-schema for each one. Build agent calls from that catalog instead of relying on
-a hard-coded list or contract.
-
-Scoring rewards a correct verdict and the artifacts you found, and penalises
-wasted tool calls. Investigating thoroughly with fewer calls beats brute force.
-
-## What is inside
-
-| Path | What it is |
-| --- | --- |
-| `src/bluesec1_agent/` | the agent: prompt, reasoning loop, tool schemas |
-| `src/bluesec1_client/` | runtime client: retries, deadlines, idempotency, validation |
-| `proto/` | the gRPC schema, if you write in another language |
-
-Change `src/bluesec1_agent/`. Start with `SYSTEM_PROMPT` in `agent.py` and the
-step budget in `.env`.
-
-## Writing your own agent
-
-The loop is short: take a task, read the tools it advertises, call them until one
-returns a terminal result.
-
-```python
-import asyncio
-
-from bluesec1_client import RemoteBenchmarkClient
-
-
-async def main() -> None:
-    async with RemoteBenchmarkClient(
-        endpoint="bluesec.team:443",
-        token="your-key",
-        verify_tls=True,
-        agent_name="my-agent",
-        arena="practice",  # Optional; omit to use the open default arena.
-    ) as client:
-        while (session := await client.start_task()) is not None:
-            print(session.task.observation["available_tools"])
-            # Choose tool calls from the advertised catalog and use
-            # session.call_tool(tool_name, arguments) until the task ends.
-
-
-asyncio.run(main())
-```
-
-`start_task()` returns `None` when the queue is empty. A tool call that ends the
-task carries `task_result` with your score for it.
-
-## Another language
-
-The runtime speaks gRPC. Generate a client from `proto/` and implement the
-transport contract yourself: an idempotency key per lifecycle call, a call id per
-tool call, and retries that reuse the same key.
-
-## Checks
-
-```bash
-uv run pytest
-```
-
-```bash
-uv run ruff check .
-```
+Based on the starter template provided by the BlueSec 2026 organizers
+(False-Positive-Community/bluesec1-agent). The runtime client in
+`src/bluesec1_client` and the proto definitions are their code; the agent
+harness changes in `src/bluesec1_agent` are mine.
